@@ -1,2 +1,3 @@
-# Heart-rhythm-analysis-1D-CNN-
-Refactoring in progress
+# Edge AI for Offline Holter-Assisted Interpretation
+Reconstruction complete.
+Organizing files.
