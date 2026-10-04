@@ -1,4 +1,4 @@
-# Edge AI用於離線 Holter 輔助判讀的可行性研究
+# AI用於離線 Holter 輔助判讀的可行性研究
 
 
 > 單導程原始 ECG → 自動 R 峰偵測 → 逐拍分類（N / S / V）＋ AF 偵測 → Holter 摘要報告。
