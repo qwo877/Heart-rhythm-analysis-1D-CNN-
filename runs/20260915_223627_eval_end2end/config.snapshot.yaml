@@ -1,0 +1,124 @@
+# 心律分析設定檔（本次執行使用的設定快照）
+# 所有超參集中在此；每次 run 會複製一份快照到 runs/<timestamp>_phase0/config.snapshot.yaml
+
+seed: 42
+deterministic: true       # cudnn deterministic + benchmark off，換取可重現
+device: auto              # auto | cpu | cuda
+
+data:
+  data_dir: ./mitdb_data
+  download_if_missing: true
+  window: 256             # 以 R 峰為中心的單拍窗長度（samples，360Hz ≈ 0.71s）
+  channel: MLII           # 找不到就退回第 0 個導程
+
+  # 0.3 一律排除起搏紀錄
+  exclude_records: [102, 104, 107, 217]
+
+  # 0.1 AAMI / de Chazal inter-patient split（病人完全不重疊）
+  ds1: [101, 106, 108, 109, 112, 114, 115, 116, 118, 119, 122,
+        124, 201, 203, 205, 207, 208, 209, 215, 220, 223, 230]
+  ds2: [100, 103, 105, 111, 113, 117, 121, 123, 200, 202, 210,
+        212, 213, 214, 219, 221, 222, 228, 231, 232, 233, 234]
+
+  # 從 DS1 再抽幾個「病人」做 validation（以病人為單位，不是切 beat）
+  # 必須是 ds1 的子集；挑選時確保含 S/V 類以利模型選擇
+  val_records: [114, 201, 209, 223]
+
+  # 1.5 訊號前處理（可開關的 ablation 元件）；enabled=false 維持與舊 run 可比
+  filter:
+    enabled: false
+    bandpass: true          # ~0.5–40Hz 帶通（同時去 baseline wander）
+    bp_low: 0.5
+    bp_high: 40.0
+    notch: false            # 60Hz 電源線陷波（mitdb 為美國錄製）
+    notch_freq: 60.0
+    baseline_highpass: false  # 只去漂移的 highpass（與 bandpass 二選一）
+
+model:
+  name: ecgcnn          # ecgcnn = 單尺度(僅 morphology)｜multiscale = morphology + RR context
+  dropout: 0.3
+  rr_local_window: 10   # local_avg_RR 用的鄰近 beat 半窗（拍）
+
+train:
+  epochs: 25
+  batch_size: 64
+  lr: 0.001
+  num_workers: 2          # Windows 若遇到 DataLoader 卡住可改 0
+
+  # 0.5 全部做成可開關（別 sampler 與 class_weights 同時硬開，會過度矯正）
+  use_sampler: false
+  use_class_weights: true
+  augment: true
+  normalize: true
+
+# ── ablation：single vs multi-scale 跑多個 seed，報 mean±std（避免單次 GPU 雜訊）──
+ablation:
+  seeds: [42, 43, 44]
+
+# ── Phase 1：afdb AF 任務（RR 序列 → AF / non-AF）────────────────────────────
+afdb:
+  pn_dir: afdb            # 直接從 PhysioNet 串流 annotation（不下載數 GB 訊號）
+  # data_dir: ./afdb_data # 若已 wfdb.dl_database('afdb', ...) 到本機，改用這個
+  window: 32              # 每個 RR 窗的拍數（~32 拍 ≈ 26s @72bpm）
+  step: 16               # 滑動步長（拍）
+  af_threshold: 0.5       # 窗內 AF 比例 ≥ 此值 → 標為 AF
+  af_rhythms: ["AFIB"]    # 哪些節律算 AF；標準慣例只算 AFIB（AFL/J/N 為 non-AF）
+  rr_clip: [0.2, 2.0]     # RR 秒數裁切（.qrs 未經人工校正，去極端值）；設 null 保留原始
+  # 以下為 record-level inter-patient 切分（病人不重疊）；留空用內建 23 筆預設
+  exclude_records: ["00735", "03665"]   # 無波形檔，排除
+  val_records:  ["04126", "06453", "07879", "08434"]
+  test_records: ["04048", "05121", "07162", "08405"]
+
+af_train:
+  epochs: 30
+  batch_size: 64
+  lr: 0.001
+  num_workers: 0
+  dropout: 0.3
+  use_class_weights: true
+  augment: true           # 對 RR 加小幅 jitter
+  normalize: false        # AF 靠 RR 絕對值與變異度，預設不做 per-window 標準化
+  use_hrv: false          # 1.5：rhythm 分支融 SDNN/RMSSD/pNN50 手工 HRV 特徵（late fusion）
+
+# ── Phase 1.4：joint training（beat + AF 共享 rhythm encoder）──────────────────
+# 兩個任務（mitdb beat / afdb AF）共用同一個 RhythmEncoder：AF 監督這個 encoder，
+# 它同時提供 beat 的節律 context。lambda_af=0 vs >0 即「AF 有沒有幫到 beat」的乾淨對照。
+joint:
+  epochs: 25
+  batch_size: 64
+  lr: 0.001
+  num_workers: 0
+  dropout: 0.3
+  lambda_beat: 1.0
+  lambda_af: 1.0            # 設 0 → 退化成 beat-only（rhythm encoder 只吃 beat 梯度）
+  uncertainty_weighting: false  # true → 用 Kendall 2018 自動加權，忽略上面手設的 lambda
+  use_hrv: false           # 兩個 head 是否 late-fuse HRV
+  use_class_weights: true  # beat 任務的 class weights（AF 任務類別較平衡，內部固定加權）
+  augment: true
+  normalize: true          # 僅作用在 morphology 窗；RR 序列一律保留原始秒值
+
+# ── Phase 2.0：minimal CLOCS SSL 參考線 + 表示品質儀器化 ──────────────────────
+# pretrain 只用 DS1 train beats（絕不含 DS2）。詳見 PHASE2_PROTOCOL.md。
+ssl:
+  epochs: 100            # 對比預訓練 epoch 數
+  batch_size: 256        # 對比學習需較大 batch 提供足夠負樣本
+  lr: 0.001
+  num_workers: 0
+  temperature: 0.5       # NT-Xent 溫度
+  proj_hidden: 64        # 投影頭隱藏維（下游丟棄）
+  proj_dim: 64           # 投影空間維度
+  # 兩視圖增強（minimal CLOCS 的正對定義：InfoNCE + noise/roll [+scale]）
+  noise_std: 0.05
+  max_shift: 10          # 循環位移最大樣本數
+  scale_range: [0.85, 1.15]  # 振幅縮放範圍（導程增益差異）；設 null 關閉
+  # Phase 2.2 正對定義 ablation（afdb RR 窗）
+  rr_noise_std: 0.02     # RR 窗 jitter（秒）；AF 靠絕對 RR，jitter 要小
+  temporal_window: 2     # temporal 正對取「同 record ±N 窗」內的相鄰窗
+  # linear-probe（凍結 encoder + 線性頭；三種 encoder 同尺評估）
+  # 全批 Adam，需足夠步數收斂（否則少數類 S 的線性頭訓不動 → 低估表示品質）；
+  # 以 val macro-F1 選最佳，多跑無害。
+  probe_epochs: 300
+  probe_lr: 0.01
+
+output:
+  root: ./runs
