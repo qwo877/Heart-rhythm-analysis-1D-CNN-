@@ -1,0 +1,80 @@
+# 超參數集中在此
+# 每次執行會複製一份快照到 runs/<timestamp>_<腳本名>/config.snapshot.yaml，讓結果與設定綁在一起
+
+seed: 42
+deterministic: true       # cudnn deterministic + benchmark off，換取可重現
+device: auto              # auto | cpu | cuda
+
+data:
+  data_dir: ./mitdb_data
+  download_if_missing: true
+  window: 256             # 以 R 峰為中心的單拍窗長度（samples，360Hz ≈ 0.71s）
+  channel: MLII           # 找不到就退回第 0 個導程
+
+  # 一律排除起搏紀錄
+  exclude_records: [102, 104, 107, 217]
+
+  # AAMI / de Chazal inter-patient split（病人完全不重疊）
+  ds1: [101, 106, 108, 109, 112, 114, 115, 116, 118, 119, 122,
+        124, 201, 203, 205, 207, 208, 209, 215, 220, 223, 230]
+  ds2: [100, 103, 105, 111, 113, 117, 121, 123, 200, 202, 210,
+        212, 213, 214, 219, 221, 222, 228, 231, 232, 233, 234]
+
+  # 從 DS1 再抽幾個「病人」做 validation（以病人為單位，不是切 beat）
+  # 必須是 ds1 的子集；挑選時確保含 S/V 類以利模型選擇
+  val_records: [114, 201, 209, 223]
+
+  # 訊號前處理（可開關）；部署版本不濾波（enabled: false）
+  filter:
+    enabled: false
+    bandpass: true          # ~0.5–40Hz 帶通（同時去 baseline wander）
+    bp_low: 0.5
+    bp_high: 40.0
+    notch: false            # 60Hz 電源線陷波（mitdb 為美國錄製）
+    notch_freq: 60.0
+    baseline_highpass: false  # 只去漂移的 highpass（與 bandpass 二選一）
+
+model:
+  dropout: 0.3
+  rr_local_window: 10   # local_avg_RR 用的鄰近 beat 半窗（拍）
+
+train:                    # train_beat.py：逐拍模型
+  epochs: 25
+  batch_size: 64
+  lr: 0.001
+  num_workers: 2          # Windows 若遇到 DataLoader 卡住可改 0
+  use_class_weights: true # 少數類加權（S、V 樣本少）
+  augment: true
+  normalize: true
+
+# 逐拍模型跑多個 seed，報 mean±std（避免單次 GPU 雜訊）；部署版本是這 3 個 seed 的 ensemble
+ablation:
+  seeds: [42, 43, 44]
+
+#  AF：afdb RR 序列 → AF / non-AF 
+afdb:
+  pn_dir: afdb            # 直接從 PhysioNet 串流 annotation（不下載數 GB 訊號）
+  # data_dir: ./afdb_data # 若已 wfdb.dl_database('afdb', ...) 到本機，改用這個
+  window: 32              # 每個 RR 窗的拍數（~32 拍 ≈ 26s @72bpm）
+  step: 16               # 滑動步長（拍）
+  af_threshold: 0.5       # 窗內 AF 比例 ≥ 此值 → 標為 AF
+  af_rhythms: ["AFIB"]    # 哪些節律算 AF；標準慣例只算 AFIB（AFL/J/N 為 non-AF）
+  rr_clip: [0.2, 2.0]     # RR 秒數裁切（.qrs 未經人工校正，去極端值）；設 null 保留原始
+  # 以下為 record-level inter-patient 切分（病人不重疊）；留空用內建 23 筆預設
+  exclude_records: ["00735", "03665"]   # 無波形檔，排除
+  val_records:  ["04126", "06453", "07879", "08434"]
+  test_records: ["04048", "05121", "07162", "08405"]
+
+af_train:                 # eval_af.py：病人層級 5-fold 交叉驗證的每個 fold
+  epochs: 30
+  batch_size: 64
+  lr: 0.001
+  num_workers: 0
+  dropout: 0.3
+  use_class_weights: true
+  augment: true           # 對 RR 加小幅 jitter
+  normalize: false        # AF 靠 RR 絕對值與變異度，預設不做 per-window 標準化
+  use_hrv: false          # rhythm 分支融 SDNN/RMSSD/pNN50 手工 HRV 特徵（部署版本不用）
+
+output:
+  root: ./runs
